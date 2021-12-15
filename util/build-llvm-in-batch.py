@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+
 from collections import namedtuple
 
 from hailtop.batch import Batch
 
 LLVM_VERSION = '13.0.0'
 SOURCE_URL = f'https://github.com/llvm/llvm-project/releases/download/llvmorg-{LLVM_VERSION}/llvm-project-{LLVM_VERSION}.src.tar.xz'
+SOURCE_SHA512_SUMS = f'75dc3df8d1229c9dce05206e9a2cab36be334e0332fe5b2a7fc01657a012a630e19f2ade84139c0124865cff5d04952f8c6ef72550d74350e8c6bca0af537ad3  llvm-project-{LLVM_VERSION}.src.tar.xz'
 SOURCE_ROOT_DIRNAME = f'llvm-project-{LLVM_VERSION}.src'
 
 CMAKE_VARIABLES = {
@@ -31,11 +33,11 @@ CMAKE_VARIABLES = {
     'MLIR_ENABLE_BINDINGS_PYTHON': 'ON',
 }
 
-ImageInfo = namedtuple('ImageInfo', 'image triple base')
+ImageInfo = namedtuple('ImageInfo', 'name image triple')
 
-DEFAULT_BUILDER = 'gcr.io/hail-vdc/mlir-hail-llvmbuilder:latest'
+DEFAULT = 'bullseye'
 BUILDERS = (
-    ImageInfo(DEFAULT_BUILDER, 'x86_64-unknown-linux-gnu', 'bullseye'),
+    ImageInfo(DEFAULT, 'gcr.io/hail-vdc/mlir-hail-llvmbuilder:latest', 'x86_64-unknown-linux-gnu'),
 )
 BUILDER_INFO = {info.name: info for info in BUILDERS}
 
@@ -44,29 +46,41 @@ def main():
     parser = argparse.ArgumentParser('batch-build-llvm')
     parser.add_argument('image', help='image to build llvm with',
                         nargs='?',
-                        default=DEFAULT_BUILDER,
+                        default=DEFAULT,
                         choices=BUILDER_INFO)
     args = parser.parse_args()
-    info = BUILDER_INFO[args.image]
+    info = BUILDER_INFO[args.name]
     print(args)
 
     batch = Batch(name=f'build llvm-{LLVM_VERSION} {info.triple} {info.base}')
     job = batch.new_bash_job()
     job.image(args.image)
+    # this build has thousands of components, we want it to finish today please
     job.cpu(16)
     job.memory('standard')
     job.storage('100Gi')
+
+    # download / check
     job.command('mkdir -p /io/src')
     job.command('cd /io/src')
-    job.command(f'curl -LsSf {SOURCE_URL} | xz -d | tar xf -')
+    job.command(f'curl -LfO {SOURCE_URL}')
+    job.command(f"echo '{SOURCE_SHA512_SUMS}' > {job.checksum_file}")
+    job.command(f'sha512sum -c {job.checksum_file}')
     job.command(f'mv {SOURCE_ROOT_DIRNAME} llvm-project')
+
+    # setup
     job.command('mkdir -p llvm-project/build')
     job.command('cd llvm-project/build')
     cmake_command = 'cmake ../llvm -Wno-dev -GNinja ' \
         + f'-DLLVM_DEFAULT_TARGET_TRIPLE={info.triple}' \
         + ' '.join(f'-D{key}={value}' for key, value in CMAKE_VARIABLES.items())
     job.command(cmake_command)
+
+    # build
     job.command('ninja')
+    job.command('python3 ../utils/lit/setup.py build')
+
+    # install
     # TODO install llvm-lit
     job.command('DESTDIR="$PWD/pkg" ninja install')
     job.command('cd pkg')
